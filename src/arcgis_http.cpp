@@ -3,9 +3,13 @@
 
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/common/error_data.hpp"
+#include "duckdb/common/exception/http_exception.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/http_util.hpp"
 #include "duckdb/common/open_file_info.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/main/database.hpp"
+#include "duckdb/main/extension_helper.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 
 namespace duckdb {
@@ -227,13 +231,68 @@ bool ArcGISJSONBool(yyjson_val *obj, const char *key, bool default_value) {
 //===--------------------------------------------------------------------===//
 // Requests
 //===--------------------------------------------------------------------===//
-static string ReadEntireFile(FileHandle &handle) {
+//! GET through DuckDB's virtual file system: served by httpfs, or by cache_httpfs when it is loaded.
+static string FetchThroughFileSystem(ClientContext &context, const string &url) {
+	auto &fs = FileSystem::GetFileSystem(context);
+	OpenFileInfo file(url);
+	// Query responses are generated per request: HEAD requests and ranged reads are not reliable on ArcGIS servers
+	// (e.g. ArcGIS Online answers HEAD with a Content-Length unrelated to the GET body), so ask httpfs to download
+	// the whole response with a single GET.
+	file.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
+	file.extended_info->options["force_full_download"] = Value::BOOLEAN(true);
+	auto handle = fs.OpenFile(file, FileFlags::FILE_FLAGS_READ);
 	// Positional read: handles reused from cache_httpfs' file handle cache may not be at offset 0
-	string result(handle.GetFileSize(), '\0');
+	string result(handle->GetFileSize(), '\0');
 	if (!result.empty()) {
-		handle.Read(&result[0], result.size(), 0);
+		handle->Read(&result[0], result.size(), 0);
 	}
 	return result;
+}
+
+//! GET through httpfs' HTTP client directly, bypassing the virtual file system and therefore cache_httpfs. httpfs
+//! settings (timeouts, retries, proxies, certificates, connection caching) and `http` secrets still apply.
+static string FetchDirect(ClientContext &context, const string &url) {
+	auto &db = DatabaseInstance::GetDatabase(context);
+	if (!db.ExtensionIsLoaded("httpfs")) {
+		// Autoload like the file system does for http(s) URLs
+		Value autoload;
+		auto may_autoload = context.TryGetCurrentSetting("autoload_known_extensions", autoload) && !autoload.IsNull() &&
+		                    BooleanValue::Get(autoload);
+		if (!may_autoload || !ExtensionHelper::TryAutoLoadExtension(context, "httpfs")) {
+			throw MissingExtensionException(
+			    "ArcGIS requests require the httpfs extension: INSTALL httpfs; LOAD httpfs;");
+		}
+	}
+	auto &http_util = HTTPUtil::Get(db);
+	auto params = http_util.InitializeParameters(context, url);
+	HTTPHeaders headers;
+	// `bearer` secrets, which httpfs applies to the files it opens
+	auto &secret_manager = SecretManager::Get(context);
+	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+	auto bearer = secret_manager.LookupSecret(transaction, url, "bearer");
+	if (bearer.HasMatch()) {
+		auto &secret = dynamic_cast<const KeyValueSecret &>(*bearer.secret_entry->secret);
+		headers.Insert("Authorization", "Bearer " + secret.TryGetValue("token", true).ToString());
+	}
+
+	string body;
+	GetRequestInfo request(
+	    url, headers, *params,
+	    [&](const HTTPResponse &) {
+		    // A new response (e.g. after a retry) replaces anything received before
+		    body.clear();
+		    return true;
+	    },
+	    [&](const_data_ptr_t data, idx_t data_length) {
+		    body.append(const_char_ptr_cast(data), data_length);
+		    return true;
+	    });
+	auto response = http_util.Request(request);
+	if (!response->Success()) {
+		throw HTTPException(*response, "HTTP GET error on '%s' (HTTP %d %s)", url, static_cast<int>(response->status),
+		                    HTTPUtil::GetStatusMessage(response->status));
+	}
+	return body;
 }
 
 //! Removes the token (raw or percent-encoded) from messages produced by lower layers, which embed the full URL.
@@ -342,15 +401,9 @@ unique_ptr<ArcGISJSON> ArcGISFetchJSON(ClientContext &context, const ArcGISUrl &
 
 	string body;
 	try {
-		auto &fs = FileSystem::GetFileSystem(context);
-		OpenFileInfo file(url.ToString());
-		// Query responses are generated per request: HEAD requests and ranged reads are not reliable on ArcGIS
-		// servers (e.g. ArcGIS Online answers HEAD with a Content-Length unrelated to the GET body), so ask httpfs
-		// to download the whole response with a single GET.
-		file.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
-		file.extended_info->options["force_full_download"] = Value::BOOLEAN(true);
-		auto handle = fs.OpenFile(file, FileFlags::FILE_FLAGS_READ);
-		body = ReadEntireFile(*handle);
+		// With the response cache enabled, responses are cached only there: going through the file system would let
+		// cache_httpfs (when loaded) store a second copy of every response
+		body = cache ? FetchDirect(context, url.ToString()) : FetchThroughFileSystem(context, url.ToString());
 	} catch (std::exception &ex) {
 		ErrorData error(ex);
 		if (error.Type() == ExceptionType::INTERRUPT) {

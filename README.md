@@ -174,6 +174,10 @@ CALL arcgis_clear_cache('https://host/arcgis/rest/services/Parcels'); -- delete 
   HTTP 200 are never cached.
 - Entries are written to a temporary file and renamed into place, so concurrent scans and processes can share a
   directory; unreadable or truncated entries are treated as missing.
+- Responses are cached only here: with a cache directory set, requests go straight to httpfs' HTTP client rather than
+  through DuckDB's file system, so `cache_httpfs` (if loaded) does not store a second copy. httpfs settings
+  (`http_timeout`, `http_retries`, proxies, certificates, `httpfs_connection_caching`) and `http` / `bearer` secrets
+  still apply.
 - A scan's pages stay consistent with its planning request (`returnCountOnly` / `returnIdsOnly`): when the planning
   response comes from the cache, pages stored for it are served from the cache and missing pages are fetched; when it
   is fetched fresh, so are all pages. `arcgis_cache_ttl_seconds` therefore expires a scan as a whole, based on its
@@ -181,7 +185,7 @@ CALL arcgis_clear_cache('https://host/arcgis/rest/services/Parcels'); -- delete 
 
 ### cache_httpfs
 
-Requests are plain GETs through DuckDB's virtual file system, so the
+Without `arcgis_cache_directory`, requests are plain GETs through DuckDB's virtual file system, so the
 [`cache_httpfs`](https://duckdb.org/community_extensions/extensions/cache_httpfs.html) community extension serves
 repeated requests for the same URL from its file handle cache within a DuckDB process
 (`cache_httpfs_file_handle_cache_entry_timeout_millisec`, default 1 hour). Its on-disk cache does not avoid requests
