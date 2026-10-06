@@ -23,6 +23,53 @@ HTTP requests go through DuckDB's file system layer, i.e. the `httpfs` extension
 `autoload_known_extensions` is enabled, otherwise `LOAD httpfs` first). httpfs settings such as `http_proxy`,
 `http_timeout` and `http_retries` apply.
 
+## Installation
+
+The extension is not in DuckDB's extension repositories; install it from a file attached to a
+[GitHub release](https://github.com/zbyte64/duckdb-arcgis/releases). A binary only loads into the exact DuckDB
+version and platform it was built for; releases are built for **DuckDB v1.5.6**.
+
+1. Find your DuckDB version and platform:
+
+   ```sql
+   SELECT version() AS version, platform FROM pragma_platform();
+   ```
+
+2. Download `arcgis-<release>-duckdb-v1.5.6-<platform>.zip` from the release and unzip it. Keep the file name
+   `arcgis.duckdb_extension`: DuckDB derives the extension's entry point from it.
+
+3. The binaries are not signed by DuckDB, so unsigned extensions must be allowed when the database is opened (the
+   setting cannot be changed afterwards). `INSTALL` copies the file to `~/.duckdb/extensions/v1.5.6/<platform>/`,
+   after which `LOAD arcgis` works in every session that allows unsigned extensions.
+
+   CLI:
+
+   ```sh
+   duckdb -unsigned
+   ```
+
+   ```sql
+   INSTALL '/path/to/arcgis.duckdb_extension';
+   LOAD arcgis;
+   ```
+
+   Python:
+
+   ```python
+   import duckdb
+
+   con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+   con.install_extension("/path/to/arcgis.duckdb_extension")  # once
+   con.load_extension("arcgis")
+   ```
+
+   Other clients: pass `allow_unsigned_extensions=true` in the database configuration, then run the same
+   `INSTALL` / `LOAD` statements.
+
+To upgrade, download the new release and run `FORCE INSTALL '/path/to/arcgis.duckdb_extension'`. Other DuckDB
+versions need a [build from source](#building) with that version checked out in the `duckdb` and
+`extension-ci-tools` submodules.
+
 ## Functions
 
 ### `arcgis_query(layer_url, ...)`
