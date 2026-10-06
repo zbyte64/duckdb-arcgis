@@ -18,4 +18,8 @@ struct ArcGISCatalogFunctions {
 	static void Register(ExtensionLoader &loader);
 };
 
+struct ArcGISCacheFunctions {
+	static void Register(ExtensionLoader &loader);
+};
+
 } // namespace duckdb

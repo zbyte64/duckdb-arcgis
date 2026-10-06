@@ -44,10 +44,19 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("arcgis_max_concurrent_requests",
 	                          "Maximum number of concurrent requests a single arcgis_query scan sends to a server",
 	                          LogicalType::UBIGINT, Value::UBIGINT(4));
+	config.AddExtensionOption("arcgis_cache_directory",
+	                          "Directory of the persistent ArcGIS response cache, shared across processes; empty "
+	                          "disables the cache",
+	                          LogicalType::VARCHAR, Value(""));
+	config.AddExtensionOption("arcgis_cache_ttl_seconds",
+	                          "Age in seconds after which cached ArcGIS responses (for scans: their planning request) "
+	                          "are fetched again; NULL never expires them",
+	                          LogicalType::BIGINT, Value(LogicalType::BIGINT));
 
 	RegisterSecret(loader);
 	ArcGISQueryFunction::Register(loader);
 	ArcGISCatalogFunctions::Register(loader);
+	ArcGISCacheFunctions::Register(loader);
 }
 
 void ArcgisExtension::Load(ExtensionLoader &loader) {

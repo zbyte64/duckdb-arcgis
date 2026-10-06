@@ -1,4 +1,5 @@
 #include "arcgis_http.hpp"
+#include "arcgis_cache.hpp"
 
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/common/error_data.hpp"
@@ -176,15 +177,24 @@ string ArcGISUrl::ToRedactedString() const {
 //===--------------------------------------------------------------------===//
 // JSON helpers
 //===--------------------------------------------------------------------===//
-ArcGISJSON::ArcGISJSON(yyjson_doc *doc_p) : doc(doc_p) {
+ArcGISJSON::ArcGISJSON(yyjson_doc *doc_p, yyjson_val *root_p, timestamp_t written_at_p, bool from_cache_p)
+    : doc(doc_p), root(root_p), written_at(written_at_p), from_cache(from_cache_p) {
 }
 
 ArcGISJSON::~ArcGISJSON() {
 	yyjson_doc_free(doc);
 }
 
-yyjson_val *ArcGISJSON::Root() const {
-	return yyjson_doc_get_root(doc);
+yyjson_doc *ArcGISParseJSON(const string &body, yyjson_read_err &err) {
+	// Without YYJSON_READ_INSITU the input is not modified
+	return yyjson_read_opts(const_cast<char *>(body.data()), body.size(), YYJSON_READ_ALLOW_INF_AND_NAN, nullptr, &err);
+}
+
+ArcGISCachePolicy ArcGISCachePolicy::ForScan(const ArcGISJSON &planning_response) {
+	ArcGISCachePolicy result;
+	result.read = planning_response.FromCache();
+	result.snapshot = planning_response.WrittenAt().value;
+	return result;
 }
 
 string ArcGISJSONString(yyjson_val *obj, const char *key, const string &default_value) {
@@ -321,7 +331,15 @@ void ArcGISCheckResponse(yyjson_val *root, const ArcGISUrl &url) {
 	throw IOException(result);
 }
 
-unique_ptr<ArcGISJSON> ArcGISFetchJSON(ClientContext &context, const ArcGISUrl &url) {
+unique_ptr<ArcGISJSON> ArcGISFetchJSON(ClientContext &context, const ArcGISUrl &url, const ArcGISCachePolicy &policy) {
+	auto cache = ArcGISResponseCache::Get(context);
+	if (cache && policy.read) {
+		auto cached = cache->Lookup(url, policy);
+		if (cached) {
+			return cached;
+		}
+	}
+
 	string body;
 	try {
 		auto &fs = FileSystem::GetFileSystem(context);
@@ -341,16 +359,20 @@ unique_ptr<ArcGISJSON> ArcGISFetchJSON(ClientContext &context, const ArcGISUrl &
 		throw IOException("ArcGIS request failed: %s", RedactToken(error.RawMessage(), url));
 	}
 
+	auto written_at = Timestamp::GetCurrentTimestamp();
 	yyjson_read_err err;
-	auto doc =
-	    yyjson_read_opts(const_cast<char *>(body.data()), body.size(), YYJSON_READ_ALLOW_INF_AND_NAN, nullptr, &err);
+	auto doc = ArcGISParseJSON(body, err);
 	if (!doc) {
 		throw IOException("ArcGIS server returned a response that is not valid JSON (%s at byte %llu) for %s%s",
 		                  err.msg, static_cast<uint64_t>(err.pos), url.ToRedactedString(),
 		                  body.empty() ? string(": empty response") : ": " + BodyExcerpt(body));
 	}
-	auto result = make_uniq<ArcGISJSON>(doc);
+	auto result = make_uniq<ArcGISJSON>(doc, yyjson_doc_get_root(doc), written_at, /*from_cache=*/false);
 	ArcGISCheckResponse(result->Root(), url);
+	if (cache) {
+		// Only responses that passed the checks above are stored: errors reported with HTTP 200 are never cached
+		cache->Store(url, body, written_at, policy.snapshot);
+	}
 	return result;
 }
 

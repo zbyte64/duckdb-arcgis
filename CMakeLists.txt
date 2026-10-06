@@ -14,6 +14,7 @@ include_directories(src/include)
 
 set(EXTENSION_SOURCES
     src/arcgis_extension.cpp
+    src/arcgis_cache.cpp
     src/arcgis_catalog.cpp
     src/arcgis_geometry.cpp
     src/arcgis_http.cpp
@@ -21,6 +22,8 @@ set(EXTENSION_SOURCES
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
+# SHA-256 of cache keys (arcgis_cache.cpp); the static extension gets it from duckdb_static
+target_link_libraries(${LOADABLE_EXTENSION_NAME} duckdb_mbedtls)
 
 install(
   TARGETS ${EXTENSION_NAME}

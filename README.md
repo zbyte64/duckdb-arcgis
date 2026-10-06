@@ -146,25 +146,48 @@ CREATE SECRET agol (TYPE arcgis, TOKEN '<token>', SCOPE 'https://services.arcgis
 
 Precedence: `token :=` parameter, then a token in the URL, then the best matching `arcgis` secret.
 
-## Caching with cache_httpfs
+## Caching
+
+### Persistent response cache
+
+Set `arcgis_cache_directory` to keep every successful response on disk and answer repeated requests from it, across
+DuckDB processes and restarts:
+
+```sql
+SET arcgis_cache_directory = '/var/cache/duckdb-arcgis';
+SET arcgis_cache_ttl_seconds = 86400;                -- optional; NULL (default) never expires entries
+SELECT count(*) FROM arcgis_query('...');            -- requests sent, responses stored
+-- any later process with the same settings:
+SELECT count(*) FROM arcgis_query('...');            -- no requests
+CALL arcgis_clear_cache();                           -- delete all entries
+CALL arcgis_clear_cache('https://host/arcgis/rest/services/Parcels'); -- delete entries whose URL starts with this
+```
+
+- Every request goes through the cache: layer metadata (so binding a view costs no request), count and object id
+  requests, every page, and `arcgis_layers` / `arcgis_services`. The default (empty directory) disables it.
+- Entries are keyed by the SHA-256 of the request URL without its token (`<dir>/<2 hex>/<sha256>.json`), so tokens
+  can rotate without invalidating the cache. The token is never written to disk, but responses of secured layers are:
+  anyone who can read the directory can read them, and a cached response is served to a query without a token.
+- The URL includes the requested columns (`outFields`) and whether geometries are requested, so `SELECT count(*)` and
+  `SELECT *` over the same layer are cached separately.
+- Only responses that parsed and passed the [error checks](#error-handling) are stored; ArcGIS errors returned with
+  HTTP 200 are never cached.
+- Entries are written to a temporary file and renamed into place, so concurrent scans and processes can share a
+  directory; unreadable or truncated entries are treated as missing.
+- A scan's pages stay consistent with its planning request (`returnCountOnly` / `returnIdsOnly`): when the planning
+  response comes from the cache, pages stored for it are served from the cache and missing pages are fetched; when it
+  is fetched fresh, so are all pages. `arcgis_cache_ttl_seconds` therefore expires a scan as a whole, based on its
+  planning response; other requests (metadata, catalog listings, unpaginated queries) expire individually.
+
+### cache_httpfs
 
 Requests are plain GETs through DuckDB's virtual file system, so the
 [`cache_httpfs`](https://duckdb.org/community_extensions/extensions/cache_httpfs.html) community extension serves
-them once it is loaded:
-
-```sql
-INSTALL cache_httpfs FROM community;
-LOAD cache_httpfs;
-SELECT count(*) FROM arcgis_query('...'); -- requests sent
-SELECT count(*) FROM arcgis_query('...'); -- served from cache, no requests
-```
-
-Repeated requests for the same URL (same query, page and token) are answered from cache_httpfs' file handle cache
-for its lifetime (`cache_httpfs_file_handle_cache_entry_timeout_millisec`, default 1 hour) within a DuckDB process.
-Use `cache_httpfs_clear_cache()` to see fresh server data. ArcGIS responses are generated per request, so their size
-is only known after downloading them; the extension therefore asks httpfs for a single full GET (no HEAD or range
-requests, which ArcGIS servers do not answer reliably). As a consequence cache_httpfs' on-disk cache does not avoid
-requests across processes.
+repeated requests for the same URL from its file handle cache within a DuckDB process
+(`cache_httpfs_file_handle_cache_entry_timeout_millisec`, default 1 hour). Its on-disk cache does not avoid requests
+across processes: ArcGIS responses are generated per request, so the extension asks httpfs for a single full GET (no
+HEAD or range requests, which ArcGIS servers do not answer reliably), and httpfs sends it when the file is opened,
+before cache_httpfs consults its disk cache. Use `arcgis_cache_directory` for caching across processes.
 
 ## Limitations
 

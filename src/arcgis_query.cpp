@@ -59,6 +59,8 @@ struct ArcGISQueryGlobalState : public GlobalTableFunctionState {
 	vector<column_t> column_ids;
 	//! The query request without paging parameters
 	ArcGISUrl request_url;
+	//! Which cached responses page requests may use (consistent with the planning request)
+	ArcGISCachePolicy page_cache;
 	idx_t max_threads = 1;
 
 	idx_t MaxThreads() const override {
@@ -344,7 +346,8 @@ idx_t MaxConcurrentRequests(ClientContext &context) {
 	return 1;
 }
 
-void PlanOffsetPages(ClientContext &context, const ArcGISQueryBindData &bind, vector<ArcGISPage> &pages) {
+//! Plans the pages of an offset paginated scan; returns the cache policy for its page requests
+ArcGISCachePolicy PlanOffsetPages(ClientContext &context, const ArcGISQueryBindData &bind, vector<ArcGISPage> &pages) {
 	auto url = bind.query_url;
 	url.SetParam("where", bind.where);
 	url.SetParam("returnCountOnly", "true");
@@ -360,9 +363,12 @@ void PlanOffsetPages(ClientContext &context, const ArcGISQueryBindData &bind, ve
 		page.count = MinValue<idx_t>(bind.page_size, static_cast<idx_t>(count) - offset);
 		pages.push_back(std::move(page));
 	}
+	return ArcGISCachePolicy::ForScan(*response);
 }
 
-void PlanObjectIdPages(ClientContext &context, const ArcGISQueryBindData &bind, vector<ArcGISPage> &pages) {
+//! Plans the pages of an object id paginated scan; returns the cache policy for its page requests
+ArcGISCachePolicy PlanObjectIdPages(ClientContext &context, const ArcGISQueryBindData &bind,
+                                    vector<ArcGISPage> &pages) {
 	auto url = bind.query_url;
 	url.SetParam("where", bind.where);
 	url.SetParam("returnIdsOnly", "true");
@@ -396,6 +402,7 @@ void PlanObjectIdPages(ClientContext &context, const ArcGISQueryBindData &bind, 
 		page.object_ids.assign(ids.begin() + static_cast<int64_t>(start), ids.begin() + static_cast<int64_t>(end));
 		pages.push_back(std::move(page));
 	}
+	return ArcGISCachePolicy::ForScan(*response);
 }
 
 unique_ptr<GlobalTableFunctionState> ArcGISQueryInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
@@ -444,10 +451,10 @@ unique_ptr<GlobalTableFunctionState> ArcGISQueryInitGlobal(ClientContext &contex
 
 	switch (bind.pagination) {
 	case ArcGISPagination::OFFSET:
-		PlanOffsetPages(context, bind, result->pages);
+		result->page_cache = PlanOffsetPages(context, bind, result->pages);
 		break;
 	case ArcGISPagination::OBJECT_ID:
-		PlanObjectIdPages(context, bind, result->pages);
+		result->page_cache = PlanObjectIdPages(context, bind, result->pages);
 		break;
 	case ArcGISPagination::NONE:
 		result->pages.emplace_back();
@@ -483,8 +490,9 @@ struct ArcGISResponseInfo {
 	bool exceeded_transfer_limit = false;
 };
 
-ArcGISResponseInfo FetchFeatures(ClientContext &context, ArcGISQueryLocalState &state, const ArcGISUrl &url) {
-	auto response = ArcGISFetchJSON(context, url);
+ArcGISResponseInfo FetchFeatures(ClientContext &context, const ArcGISQueryGlobalState &gstate,
+                                 ArcGISQueryLocalState &state, const ArcGISUrl &url) {
+	auto response = ArcGISFetchJSON(context, url, gstate.page_cache);
 	auto root = response->Root();
 	auto features = yyjson_obj_get(root, "features");
 	if (!yyjson_is_arr(features)) {
@@ -510,7 +518,7 @@ void FetchOffsetPage(ClientContext &context, const ArcGISQueryGlobalState &gstat
 		auto url = gstate.request_url;
 		url.SetParam("resultOffset", to_string(page.offset + received));
 		url.SetParam("resultRecordCount", to_string(page.count - received));
-		auto info = FetchFeatures(context, state, url);
+		auto info = FetchFeatures(context, gstate, state, url);
 		if (info.feature_count == 0) {
 			// Features were deleted since the count was taken
 			break;
@@ -531,7 +539,7 @@ void FetchObjectIdPage(ClientContext &context, const ArcGISQueryBindData &bind, 
 	url.SetParam("where", StringUtil::Format("(%s) AND %s >= %lld AND %s <= %lld", bind.where, oid,
 	                                         static_cast<long long>(page.object_ids.front()), oid,
 	                                         static_cast<long long>(page.object_ids.back())));
-	auto info = FetchFeatures(context, state, url);
+	auto info = FetchFeatures(context, gstate, state, url);
 	if (!info.exceeded_transfer_limit) {
 		return;
 	}
@@ -558,7 +566,7 @@ void FetchObjectIdPage(ClientContext &context, const ArcGISQueryBindData &bind, 
 		auto retry_url = gstate.request_url;
 		retry_url.SetParam("objectIds", StringUtil::Join(batch, ","));
 		auto first_new = state.features.size();
-		auto retry_info = FetchFeatures(context, state, retry_url);
+		auto retry_info = FetchFeatures(context, gstate, state, retry_url);
 		for (idx_t i = first_new; i < state.features.size(); i++) {
 			int64_t id;
 			if (TryGetObjectId(state.features[i], oid, id)) {
@@ -596,7 +604,7 @@ void FetchPage(ClientContext &context, const ArcGISQueryBindData &bind, const Ar
 		FetchObjectIdPage(context, bind, gstate, state, page);
 		break;
 	case ArcGISPagination::NONE: {
-		auto info = FetchFeatures(context, state, gstate.request_url);
+		auto info = FetchFeatures(context, gstate, state, gstate.request_url);
 		if (info.exceeded_transfer_limit && bind.error_on_truncation) {
 			throw IOException("ArcGIS server returned a partial result (exceededTransferLimit) for %s, and the layer "
 			                  "supports neither pagination nor object ids. Use pagination := 'none' to accept the "

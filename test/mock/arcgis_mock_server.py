@@ -6,12 +6,14 @@ errors reported with HTTP 200. Query `where` clauses are evaluated with SQLite.
 
 Usage: arcgis_mock_server.py [--port PORT]
 Prints "READY <port>" once listening. GET /__stats returns {"requests": n} (query + metadata requests so far),
-GET /__reset resets the counter.
+GET /__reset resets the counter, GET /__fail_queries?enabled=true|false makes every layer query fail with HTTP 200 and
+an error body.
 """
 
 import argparse
 import json
 import random
+import re
 import sqlite3
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -122,7 +124,7 @@ ERROR_LAYER = 3
 TOKEN_LAYER = 4
 
 lock = threading.Lock()
-stats = {"requests": 0}
+stats = {"requests": 0, "fail_queries": False}
 
 
 def build_db():
@@ -229,23 +231,51 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def control_body(self):
+        """Body of a test control endpoint (None for other paths). Control endpoints are idempotent."""
+        url = urlparse(self.path)
+        params = parse_qs(url.query, keep_blank_values=True)
+        path = url.path.rstrip("/")
+        if path == "/__reset":
+            stats["requests"] = 0
+        elif path == "/__fail_queries":
+            stats["fail_queries"] = params.get("enabled", ["false"])[0] == "true"
+            return json.dumps({"fail_queries": stats["fail_queries"]}).encode()
+        elif path != "/__stats":
+            return None
+        return json.dumps({"requests": stats["requests"]}).encode()
+
     def do_HEAD(self):  # noqa: N802
-        # Like ArcGIS Online: a HEAD response whose Content-Length has nothing to do with the GET body
+        # Control endpoints behave like static files so that read_text (HEAD, then ranged GETs) can fetch them
+        data = self.control_body()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", "7")
+        # Like ArcGIS Online: a HEAD response whose Content-Length has nothing to do with the GET body
+        self.send_header("Content-Length", "7" if data is None else str(len(data)))
         self.end_headers()
+
+    def send_control(self, data):
+        ranged = re.fullmatch(r"bytes=(\d+)-(\d*)", self.headers.get("Range", ""))
+        if not ranged:
+            return self.send_body(data.decode())
+        start = int(ranged.group(1))
+        end = int(ranged.group(2)) if ranged.group(2) else len(data) - 1
+        chunk = data[start : end + 1]
+        self.send_response(206)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Range", f"bytes {start}-{start + len(chunk) - 1}/{len(data)}")
+        self.send_header("Content-Length", str(len(chunk)))
+        self.end_headers()
+        self.wfile.write(chunk)
 
     def do_GET(self):  # noqa: N802
         url = urlparse(self.path)
         params = parse_qs(url.query, keep_blank_values=True)
         path = url.path.rstrip("/")
 
-        if path == "/__stats":
-            return self.send_body(dict(stats))
-        if path == "/__reset":
-            stats["requests"] = 0
-            return self.send_body(dict(stats))
+        control = self.control_body()
+        if control is not None:
+            return self.send_control(control)
         with lock:
             stats["requests"] += 1
 
@@ -302,7 +332,7 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 1:
             return self.send_body(layer["metadata"])
         if parts[1:] == ["query"]:
-            if layer_id == ERROR_LAYER:
+            if layer_id == ERROR_LAYER or stats["fail_queries"]:
                 return self.send_body(error_body(400, "Unable to complete operation.", ["Invalid query parameters."]))
             return self.send_body(run_query(layer, params))
         return self.send_body(error_body(400, "Invalid URL"))

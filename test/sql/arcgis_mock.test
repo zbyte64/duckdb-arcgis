@@ -201,3 +201,215 @@ SELECT id, name, type, geometry_type, url = getvariable('svc') || '/' || id FROM
 4	secured	Feature Layer	esriGeometryPoint	true
 5	lines	Feature Layer	esriGeometryPolyline	true
 6	capped	Feature Layer	esriGeometryPoint	true
+
+# Persistent response cache (arcgis_cache_directory)
+statement ok
+SET arcgis_cache_directory = '__TEST_DIR__/arcgis_cache';
+
+query I
+SELECT content FROM read_text('${ARCGIS_MOCK_URL}/__reset?n=1');
+----
+{"requests": 0}
+
+# Offset pagination: metadata, count and 3 pages
+query II
+SELECT OBJECTID, geometry::VARCHAR FROM arcgis_query(getvariable('svc') || '/0');
+----
+1	POLYGON ((0 0, 0 10, 10 10, 10 0, 0 0))
+2	POLYGON ((0 0, 0 10, 10 10, 10 0, 0 0), (2 2, 4 2, 4 4, 2 4, 2 2))
+3	NULL
+5	MULTIPOLYGON (((0 0, 0 10, 10 10, 10 0, 0 0)), ((20 0, 20 5, 25 5, 25 0, 20 0)))
+8	MULTIPOLYGON (((20 0, 20 5, 25 5, 25 0, 20 0)), ((0 0, 0 10, 10 10, 10 0, 0 0), (2 2, 4 2, 4 4, 2 4, 2 2)))
+13	POLYGON EMPTY
+21	POLYGON ((0 0, 0 1, 1 1, 1 0, 0 0))
+
+query I
+SELECT content FROM read_text('${ARCGIS_MOCK_URL}/__stats?n=1');
+----
+{"requests": 5}
+
+# Object id pagination with truncated responses: metadata, ids, the page and its object id retries
+query II
+SELECT OBJECTID, geometry::VARCHAR FROM arcgis_query(getvariable('svc') || '/5') ORDER BY OBJECTID;
+----
+1	LINESTRING (0 0, 1 1)
+2	MULTILINESTRING ((0 0, 1 1), (2 2, 2 0))
+3	LINESTRING (0 0, 3 3)
+5	LINESTRING (0 0, 5 5)
+8	MULTILINESTRING ((0 0, 1 1), (2 2, 8 0))
+13	LINESTRING (0 0, 13 13)
+21	LINESTRING (0 0, 21 21)
+
+query I
+SELECT content FROM read_text('${ARCGIS_MOCK_URL}/__stats?n=2');
+----
+{"requests": 11}
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/arcgis_cache/*/*.json');
+----
+11
+
+# A new database instance (like a new process) is served entirely from the cache directory
+restart
+
+statement ok
+LOAD httpfs;
+
+statement ok
+SET VARIABLE svc = '${ARCGIS_MOCK_URL}/arcgis/rest/services/Test/FeatureServer';
+
+statement ok
+SET arcgis_cache_directory = '__TEST_DIR__/arcgis_cache';
+
+query I
+SELECT content FROM read_text('${ARCGIS_MOCK_URL}/__reset?n=2');
+----
+{"requests": 0}
+
+query II
+SELECT OBJECTID, geometry::VARCHAR FROM arcgis_query(getvariable('svc') || '/0');
+----
+1	POLYGON ((0 0, 0 10, 10 10, 10 0, 0 0))
+2	POLYGON ((0 0, 0 10, 10 10, 10 0, 0 0), (2 2, 4 2, 4 4, 2 4, 2 2))
+3	NULL
+5	MULTIPOLYGON (((0 0, 0 10, 10 10, 10 0, 0 0)), ((20 0, 20 5, 25 5, 25 0, 20 0)))
+8	MULTIPOLYGON (((20 0, 20 5, 25 5, 25 0, 20 0)), ((0 0, 0 10, 10 10, 10 0, 0 0), (2 2, 4 2, 4 4, 2 4, 2 2)))
+13	POLYGON EMPTY
+21	POLYGON ((0 0, 0 1, 1 1, 1 0, 0 0))
+
+query II
+SELECT OBJECTID, geometry::VARCHAR FROM arcgis_query(getvariable('svc') || '/5') ORDER BY OBJECTID;
+----
+1	LINESTRING (0 0, 1 1)
+2	MULTILINESTRING ((0 0, 1 1), (2 2, 2 0))
+3	LINESTRING (0 0, 3 3)
+5	LINESTRING (0 0, 5 5)
+8	MULTILINESTRING ((0 0, 1 1), (2 2, 8 0))
+13	LINESTRING (0 0, 13 13)
+21	LINESTRING (0 0, 21 21)
+
+query I
+SELECT content FROM read_text('${ARCGIS_MOCK_URL}/__stats?n=3');
+----
+{"requests": 0}
+
+# A different projection is a different request
+query I
+SELECT count(*) FROM arcgis_query(getvariable('svc') || '/0');
+----
+7
+
+query I
+SELECT content FROM read_text('${ARCGIS_MOCK_URL}/__stats?n=4');
+----
+{"requests": 3}
+
+# When the planning request is fetched fresh, the scan's pages are fetched fresh too (one snapshot per scan)
+query I
+SELECT deleted FROM arcgis_clear_cache(getvariable('svc') || '/0/query?where=1%3D1&returnCountOnly=true');
+----
+1
+
+query I
+SELECT count(*) FROM arcgis_query(getvariable('svc') || '/0');
+----
+7
+
+query I
+SELECT content FROM read_text('${ARCGIS_MOCK_URL}/__stats?n=5');
+----
+{"requests": 7}
+
+# Expired entries are fetched again
+statement ok
+SET arcgis_cache_ttl_seconds = 0;
+
+query I
+SELECT count(*) FROM arcgis_query(getvariable('svc') || '/0');
+----
+7
+
+query I
+SELECT content FROM read_text('${ARCGIS_MOCK_URL}/__stats?n=6');
+----
+{"requests": 12}
+
+statement ok
+RESET arcgis_cache_ttl_seconds;
+
+# Errors reported with HTTP 200 are never cached
+query I
+SELECT content FROM read_text('${ARCGIS_MOCK_URL}/__fail_queries?enabled=true&n=1');
+----
+{"fail_queries": true}
+
+statement error
+SELECT count(*) FROM arcgis_query(getvariable('svc') || '/0', where_clause := 'POP > 150');
+----
+ArcGIS server returned an error (code 400)
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/arcgis_cache/*/*.json');
+----
+14
+
+restart
+
+statement ok
+LOAD httpfs;
+
+statement ok
+SET VARIABLE svc = '${ARCGIS_MOCK_URL}/arcgis/rest/services/Test/FeatureServer';
+
+statement ok
+SET arcgis_cache_directory = '__TEST_DIR__/arcgis_cache';
+
+statement error
+SELECT count(*) FROM arcgis_query(getvariable('svc') || '/0', where_clause := 'POP > 150');
+----
+ArcGIS server returned an error (code 400)
+
+query I
+SELECT content FROM read_text('${ARCGIS_MOCK_URL}/__fail_queries?enabled=false&n=2');
+----
+{"fail_queries": false}
+
+query I
+SELECT count(*) FROM arcgis_query(getvariable('svc') || '/0', where_clause := 'POP > 150');
+----
+5
+
+query I
+SELECT deleted FROM arcgis_clear_cache();
+----
+17
+
+# Without a cache directory every scan sends its requests
+statement ok
+RESET arcgis_cache_directory;
+
+query I
+SELECT content FROM read_text('${ARCGIS_MOCK_URL}/__reset?n=3');
+----
+{"requests": 0}
+
+query I
+SELECT count(*) FROM arcgis_query(getvariable('svc') || '/0');
+----
+7
+
+query I
+SELECT count(*) FROM arcgis_query(getvariable('svc') || '/0');
+----
+7
+
+query I
+SELECT content FROM read_text('${ARCGIS_MOCK_URL}/__stats?n=7');
+----
+{"requests": 10}
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/arcgis_cache/*/*.json');
+----
+0
