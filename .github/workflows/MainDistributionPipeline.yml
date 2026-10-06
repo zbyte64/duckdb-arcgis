@@ -28,3 +28,51 @@ jobs:
       ci_tools_version: v1.5-variegata
       extension_name: arcgis
       format_checks: 'format;tidy'
+
+  # On a pushed `v*` tag: zip the binaries built above and attach them to the GitHub release for that tag
+  # (created if missing, assets replaced if it already exists).
+  release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [duckdb-stable-build, code-quality-check]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      # Keep in sync with duckdb_version above (env is not available in reusable-workflow inputs)
+      DUCKDB_VERSION: v1.5.6
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: arcgis-${{ env.DUCKDB_VERSION }}-extension-*
+          path: artifacts
+
+      - name: Package binaries
+        run: |
+          set -euo pipefail
+          mkdir dist
+          prefix="arcgis-${DUCKDB_VERSION}-extension-"
+          for dir in artifacts/"${prefix}"*/; do
+            arch="$(basename "$dir")"
+            arch="${arch#"$prefix"}"
+            (cd "$dir" && zip -9 "${GITHUB_WORKSPACE}/dist/arcgis-${TAG}-duckdb-${DUCKDB_VERSION}-${arch}.zip" arcgis.duckdb_extension*)
+          done
+          ls -l dist
+
+      - name: Create or update release
+        run: |
+          set -euo pipefail
+          cat > notes.md <<EOF
+          Built for **DuckDB ${DUCKDB_VERSION}** by CI run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}.
+
+          Each archive contains \`arcgis.duckdb_extension\` (\`.wasm\` for the DuckDB-Wasm builds) for one platform; pick the one matching \`SELECT platform FROM pragma_platform()\`. The binaries are unsigned. See [Installation](${{ github.server_url }}/${{ github.repository }}#installation).
+          EOF
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.zip --clobber
+          else
+            gh release create "$TAG" dist/*.zip --verify-tag --generate-notes \
+              --title "arcgis ${TAG} (DuckDB ${DUCKDB_VERSION})" --notes-file notes.md
+          fi

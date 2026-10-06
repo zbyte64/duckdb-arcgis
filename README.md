@@ -182,3 +182,13 @@ make test_mock                # test/sql/arcgis_mock.test against test/mock/arcg
 ```
 
 The build derives the extension version from git, so the repository needs at least one commit.
+
+## Releasing
+
+Push a `v*` tag. CI builds and tests every platform, then creates the GitHub release for the tag with one
+`arcgis-<tag>-duckdb-v1.5.6-<platform>.zip` per platform (if the release already exists, its archives are replaced):
+
+```sh
+git tag v0.2.0
+git push origin v0.2.0
+```
