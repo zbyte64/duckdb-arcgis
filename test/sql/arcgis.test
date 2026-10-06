@@ -1,0 +1,53 @@
+# name: test/sql/arcgis.test
+# description: arcgis extension checks that need no server
+# group: [sql]
+
+statement error
+SELECT * FROM arcgis_query('http://localhost/arcgis/rest/services/x/FeatureServer/0');
+----
+Catalog Error: Table Function with name arcgis_query does not exist!
+
+require arcgis
+
+statement error
+SELECT * FROM arcgis_query('ftp://example.com/arcgis/rest/services/x/FeatureServer/0');
+----
+ArcGIS URL must start with http:// or https://, got "ftp://example.com/arcgis/rest/services/x/FeatureServer/0"
+
+statement error
+SELECT * FROM arcgis_query(NULL);
+----
+the layer URL cannot be NULL
+
+statement error
+SELECT * FROM arcgis_query('http://localhost/arcgis/rest/services/x/FeatureServer/0', pagination := 'pages');
+----
+pagination must be one of 'auto', 'offset', 'objectid' or 'none', got 'pages'
+
+statement error
+SELECT * FROM arcgis_query('http://localhost/arcgis/rest/services/x/FeatureServer/0', page_size := 0);
+----
+page_size must be positive
+
+statement error
+SELECT * FROM arcgis_layers('localhost/arcgis/rest/services/x/FeatureServer');
+----
+ArcGIS URL must start with http:// or https://
+
+statement error
+CREATE SECRET (TYPE arcgis);
+----
+Secret type 'arcgis' requires a TOKEN
+
+statement ok
+CREATE SECRET agol (TYPE arcgis, TOKEN 'abc', SCOPE 'https://services.arcgis.com/');
+
+query I
+SELECT secret_string LIKE '%token=redacted%' FROM duckdb_secrets() WHERE name = 'agol';
+----
+true
+
+query I
+SELECT current_setting('arcgis_max_concurrent_requests');
+----
+4

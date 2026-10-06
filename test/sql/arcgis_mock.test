@@ -1,0 +1,203 @@
+# name: test/sql/arcgis_mock.test
+# description: arcgis extension against the mock server in test/mock (run with `make test_mock`)
+# group: [sql]
+
+require arcgis
+
+require-env ARCGIS_MOCK_URL
+
+statement ok
+INSTALL httpfs;
+
+statement ok
+LOAD httpfs;
+
+statement ok
+SET VARIABLE svc = '${ARCGIS_MOCK_URL}/arcgis/rest/services/Test/FeatureServer';
+
+# Schema follows the layer's fields; geometries default to EPSG:4326 (outSR=4326)
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM arcgis_query(getvariable('svc') || '/0'));
+----
+OBJECTID	BIGINT
+NAME	VARCHAR
+CATEGORY	VARCHAR
+POP	INTEGER
+AREA	DOUBLE
+SMALL	SMALLINT
+CREATED	TIMESTAMP WITH TIME ZONE
+DAY	DATE
+GLOBALID	VARCHAR
+geometry	GEOMETRY('EPSG:4326')
+
+# Without outSR the CRS comes from the layer (wkid 102100 -> latestWkid 3857)
+query I
+SELECT typeof(geometry) FROM arcgis_query(getvariable('svc') || '/0', out_sr := NULL) LIMIT 1;
+----
+GEOMETRY('EPSG:3857')
+
+# Offset pagination (maxRecordCount 3 -> 3 pages), in server order
+query IIIIIIIII
+SELECT OBJECTID, NAME, CATEGORY, POP, AREA, SMALL, epoch_ms(CREATED), DAY, GLOBALID FROM arcgis_query(getvariable('svc') || '/0');
+----
+1	alpha	a	100	1.5	1	1704067200000	2024-01-01	{00000001-0000-0000-0000-000000000000}
+2	bravo	b	200	2.5	2	1704153600000	2024-01-02	{00000002-0000-0000-0000-000000000000}
+3	charlie	a	NULL	NULL	NULL	NULL	NULL	{00000003-0000-0000-0000-000000000000}
+5	delta	b	400	4.5	4	1704326400000	2024-01-04	{00000005-0000-0000-0000-000000000000}
+8	echo	a	500	5.5	5	1704412800000	2024-01-05	{00000008-0000-0000-0000-000000000000}
+13	foxtrot	b	600	6.5	6	1704499200000	2024-01-06	{00000013-0000-0000-0000-000000000000}
+21	golf	a	700	7.5	7	1704585600000	2024-01-07	{00000021-0000-0000-0000-000000000000}
+
+# Esri rings: clockwise exteriors, counter-clockwise holes assigned to the exterior containing them
+query II
+SELECT OBJECTID, geometry::VARCHAR FROM arcgis_query(getvariable('svc') || '/0');
+----
+1	POLYGON ((0 0, 0 10, 10 10, 10 0, 0 0))
+2	POLYGON ((0 0, 0 10, 10 10, 10 0, 0 0), (2 2, 4 2, 4 4, 2 4, 2 2))
+3	NULL
+5	MULTIPOLYGON (((0 0, 0 10, 10 10, 10 0, 0 0)), ((20 0, 20 5, 25 5, 25 0, 20 0)))
+8	MULTIPOLYGON (((20 0, 20 5, 25 5, 25 0, 20 0)), ((0 0, 0 10, 10 10, 10 0, 0 0), (2 2, 4 2, 4 4, 2 4, 2 2)))
+13	POLYGON EMPTY
+21	POLYGON ((0 0, 0 1, 1 1, 1 0, 0 0))
+
+query I
+SELECT NAME FROM arcgis_query(getvariable('svc') || '/0', where_clause := 'CATEGORY = ''b'' AND POP > 200');
+----
+delta
+foxtrot
+
+# Extra query parameters are passed through and override defaults (here the paging order)
+query I
+SELECT NAME FROM arcgis_query(getvariable('svc') || '/0', query_params := MAP {'orderByFields': 'POP DESC'});
+----
+golf
+foxtrot
+echo
+delta
+bravo
+alpha
+charlie
+
+# Parameters in a pasted query URL are honored
+query I
+SELECT count(*) FROM arcgis_query(getvariable('svc') || '/0/query?where=POP%3E400&outFields=*&f=pjson');
+----
+3
+
+# Object id pagination (no pagination support, maxRecordCount 2)
+query II
+SELECT OBJECTID, geometry::VARCHAR FROM arcgis_query(getvariable('svc') || '/1');
+----
+1	POINT (1 2)
+2	POINT (2 4)
+3	POINT EMPTY
+5	POINT (5 10)
+8	POINT (8 16)
+13	POINT (13 26)
+21	POINT (21 42)
+
+query I
+SELECT NAME FROM arcgis_query(getvariable('svc') || '/0', pagination := 'objectid', page_size := 1, where_clause := 'CATEGORY = ''a''');
+----
+alpha
+charlie
+echo
+golf
+
+# Object id pagination where the server truncates below maxRecordCount: missing features are fetched by id
+query II
+SELECT OBJECTID, geometry::VARCHAR FROM arcgis_query(getvariable('svc') || '/5') ORDER BY OBJECTID;
+----
+1	LINESTRING (0 0, 1 1)
+2	MULTILINESTRING ((0 0, 1 1), (2 2, 2 0))
+3	LINESTRING (0 0, 3 3)
+5	LINESTRING (0 0, 5 5)
+8	MULTILINESTRING ((0 0, 1 1), (2 2, 8 0))
+13	LINESTRING (0 0, 13 13)
+21	LINESTRING (0 0, 21 21)
+
+# Offset pagination where the server truncates below maxRecordCount: paging continues where it stopped
+query I
+SELECT list(OBJECTID ORDER BY OBJECTID) FROM arcgis_query(getvariable('svc') || '/6');
+----
+[1, 2, 3, 5, 8, 13, 21]
+
+# Neither pagination nor object ids: a truncated response is an error unless pagination := 'none'
+statement error
+SELECT * FROM arcgis_query(getvariable('svc') || '/2');
+----
+returned a partial result (exceededTransferLimit)
+
+query I
+SELECT count(*) FROM arcgis_query(getvariable('svc') || '/2', pagination := 'none');
+----
+2
+
+# Errors reported with HTTP 200
+statement error
+SELECT * FROM arcgis_query(getvariable('svc') || '/3');
+----
+ArcGIS server returned an error (code 400): Unable to complete operation. - Invalid query parameters.
+
+statement error
+SELECT * FROM arcgis_query(getvariable('svc') || '/0', where_clause := 'NO_SUCH_FIELD = 1');
+----
+'where' parameter is invalid
+
+statement error
+SELECT * FROM arcgis_query('${ARCGIS_MOCK_URL}/arcgis/rest/services/Html/FeatureServer/0');
+----
+not valid JSON
+
+statement error
+SELECT * FROM arcgis_query(getvariable('svc'));
+----
+is not an ArcGIS layer or table
+
+# Tokens: required, validated, and never echoed in errors
+statement error
+SELECT * FROM arcgis_query(getvariable('svc') || '/4');
+----
+ArcGIS server returned an error (code 499): Token Required
+
+statement error
+SELECT * FROM arcgis_query(getvariable('svc') || '/4', token := 'not-the-token');
+----
+<REGEX>:.*code 498.*token=\*\*\*&f=json.*
+
+query I
+SELECT count(*) FROM arcgis_query(getvariable('svc') || '/4', token := 'secret-token');
+----
+7
+
+query I
+SELECT count(*) FROM arcgis_query(getvariable('svc') || '/4?token=secret-token');
+----
+7
+
+statement ok
+CREATE SECRET mock_token (TYPE arcgis, TOKEN 'secret-token', SCOPE '${ARCGIS_MOCK_URL}/arcgis/rest/services/Test/FeatureServer/4');
+
+query I
+SELECT count(*) FROM arcgis_query(getvariable('svc') || '/4');
+----
+7
+
+# Catalog functions
+query IIII
+SELECT * FROM arcgis_services('${ARCGIS_MOCK_URL}/arcgis/rest/services') ORDER BY name;
+----
+Folder	Folder/Inner	MapServer	${ARCGIS_MOCK_URL}/arcgis/rest/services/Folder/Inner/MapServer
+NULL	Html	FeatureServer	${ARCGIS_MOCK_URL}/arcgis/rest/services/Html/FeatureServer
+NULL	Test	FeatureServer	${ARCGIS_MOCK_URL}/arcgis/rest/services/Test/FeatureServer
+
+query IIIII
+SELECT id, name, type, geometry_type, url = getvariable('svc') || '/' || id FROM arcgis_layers(getvariable('svc')) ORDER BY id;
+----
+0	parcels	Feature Layer	esriGeometryPolygon	true
+1	points	Feature Layer	esriGeometryPoint	true
+2	plain_table	Table	NULL	true
+3	broken	Feature Layer	esriGeometryPoint	true
+4	secured	Feature Layer	esriGeometryPoint	true
+5	lines	Feature Layer	esriGeometryPolyline	true
+6	capped	Feature Layer	esriGeometryPoint	true
